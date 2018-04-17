@@ -83,6 +83,7 @@ from airflow.utils.dates import cron_presets, date_range as utils_date_range
 from airflow.utils.db import provide_session
 from airflow.utils.decorators import apply_defaults
 from airflow.utils.email import send_email
+from airflow.utils.dingbot import dingbot_msg_sender
 from airflow.utils.helpers import (
     as_tuple, is_container, is_in, validate_key, pprinttable)
 from airflow.utils.operator_resources import Resources
@@ -1708,6 +1709,24 @@ class TaskInstance(Base, LoggingMixin):
             self.log.error('Failed to send email to: %s', task.email)
             self.log.exception(e2)
 
+        try:
+            if task.retries and self.try_number <= self.max_tries:
+                self.state = State.UP_FOR_RETRY
+                self.log.info('Marking task as UP_FOR_RETRY')
+                if task.ding_on_retry:
+                    self.dingbot_alert(error, is_retry=True)
+            else:
+                self.state = State.FAILED
+                if task.retries:
+                    self.log.info('All retries failed; marking task as FAILED')
+                else:
+                    self.log.info('Marking task as FAILED.')
+                if task.ding_on_failure:
+                    self.dingbot_alert(error, is_retry=False)
+        except Exception as e2:
+            self.log.error('Failed to send dingding message')
+            self.log.exception(e2)
+
         # Handling callbacks pessimistically
         try:
             if self.state == State.UP_FOR_RETRY and task.on_retry_callback:
@@ -1861,6 +1880,18 @@ class TaskInstance(Base, LoggingMixin):
             "Mark success: <a href='{self.mark_success_url}'>Link</a><br>"
         ).format(try_number=self.try_number, max_tries=self.max_tries + 1, **locals())
         send_email(task.email, title, body)
+
+    def dingbot_alert(self, exception, is_retry=False):
+        task = self.task
+        title = "Airflow alert: {self}".format(**locals())
+        exception = str(exception).replace('\n', '<br>')
+        body = (
+            "<h2> {self.task_id} </h2> <br>"
+            "Try {try_number} out of {max_tries}<br>"
+            "Exception:<br>{exception}<br>"
+            "Log: <a href='{self.log_url}'>Link</a><br>"
+        ).format(try_number=self.try_number, max_tries=self.max_tries + 1, **locals())
+        dingbot_msg_sender(body)
 
     def set_duration(self):
         if self.end_date and self.start_date:
@@ -2235,6 +2266,8 @@ class BaseOperator(LoggingMixin):
             email=None,
             email_on_retry=True,
             email_on_failure=True,
+            ding_on_retry=True,
+            ding_on_failure=True,
             retries=0,
             retry_delay=timedelta(seconds=300),
             retry_exponential_backoff=False,
@@ -2281,6 +2314,8 @@ class BaseOperator(LoggingMixin):
         self.email = email
         self.email_on_retry = email_on_retry
         self.email_on_failure = email_on_failure
+        self.ding_on_retry = ding_on_retry
+        self.ding_on_failure = ding_on_failure
         self.start_date = start_date
         if start_date and not isinstance(start_date, datetime):
             self.log.warning("start_date for %s isn't datetime.datetime", self)
